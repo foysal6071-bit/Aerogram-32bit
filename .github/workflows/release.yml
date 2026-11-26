@@ -1,0 +1,206 @@
+name: Build AeroGram (Audio + Video Call) 32-bit
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          df -h /
+
+      - name: Clone Telegram Android source
+        run: git clone --depth 1 --recursive --shallow-submodules https://github.com/DrKLO/Telegram.git Telegram
+
+      # Patch script ekhane-i embedded (zip/scripts lagbe na).
+      # Kono pattern na mille build fail hoy na, shudhu WARN dekhay.
+      - name: Patch (rebrand + credentials)
+        env:
+          APP_ID: ${{ secrets.TG_API_ID }}
+          APP_HASH: ${{ secrets.TG_API_HASH }}
+          APP_NAME: AeroGram
+          APP_PKG: org.aerogram.video
+        run: |
+          python3 - <<'PY'
+          import os, re, pathlib
+
+          SRC = pathlib.Path("Telegram")
+          APP_ID = os.environ.get("APP_ID", "").strip()
+          APP_HASH = os.environ.get("APP_HASH", "").strip()
+          APP_NAME = os.environ.get("APP_NAME", "AeroGram")
+          APP_PKG = os.environ.get("APP_PKG", "org.aerogram.video")
+
+          def read(p):
+              return p.read_text(encoding="utf-8", errors="ignore")
+
+          def patch(files, pattern, repl, label):
+              total = 0
+              for p in files:
+                  t = read(p)
+                  t2, n = re.subn(pattern, repl, t)
+                  if n:
+                      p.write_text(t2, encoding="utf-8")
+                      total += n
+                      print(f"ok   {label}: {p} ({n})")
+              if total == 0:
+                  print(f"WARN {label}: kono pattern mile nai (skip)")
+              return total
+
+          # 1) applicationId (alada package, original Telegram-er sathe conflict hobe na)
+          gradles = [p for p in SRC.rglob("build.gradle*")
+                     if p.parts[1].startswith("TMessagesProj") and "build" not in p.parts[2:-1]]
+          n = patch(gradles, r'applicationId(\s*=?\s*)(["\'])[^"\']+\2',
+                    lambda m: f'applicationId{m.group(1)}{m.group(2)}{APP_PKG}{m.group(2)}',
+                    "applicationId")
+          if n == 0:
+              for g in gradles:
+                  for i, line in enumerate(read(g).splitlines(), 1):
+                      if "applicationId" in line:
+                          print(f"DEBUG {g}:{i}: {line.strip()}")
+
+          # 2) API credentials (secret na dile default thakbe)
+          bv = list(SRC.rglob("BuildVars.java"))
+          if APP_ID.isdigit():
+              patch(bv, r'(APP_ID\s*=\s*)\d+(\s*;)', lambda m: f'{m.group(1)}{APP_ID}{m.group(2)}', "APP_ID")
+          else:
+              print("skip APP_ID: secret deya hoy nai, default thakbe")
+          if APP_HASH:
+              patch(bv, r'(APP_HASH\s*=\s*")[^"]*(")', lambda m: f'{m.group(1)}{APP_HASH}{m.group(2)}', "APP_HASH")
+          else:
+              print("skip APP_HASH: secret deya hoy nai, default thakbe")
+
+          # 3) App name
+          xmls = [p for p in SRC.rglob("*.xml")
+                  if p.parts[1].startswith("TMessagesProj")
+                  and "res" in p.parts and p.parent.name == "values" and p.name.startswith("strings")]
+          patch(xmls, r'(<string\s+name="AppName"[^>]*>)[^<]*(</string>)',
+                lambda m: f'{m.group(1)}{APP_NAME}{m.group(2)}', "AppName")
+          print("PATCH DONE (video: audio call + video call)")
+          PY
+
+      # 32-bit only: sudhu armeabi-v7a native library thakbe (APK onek chhoto, build druto)
+      - name: Limit to 32-bit (armeabi-v7a)
+        env:
+          ABIS: armeabi-v7a
+        run: |
+          python3 - <<'PY'
+          import os, re, pathlib
+
+          SRC = pathlib.Path("Telegram")
+          abis = [a.strip() for a in os.environ["ABIS"].split(",") if a.strip()]
+          hits = 0
+          for g in SRC.rglob("build.gradle*"):
+              if not g.parts[1].startswith("TMessagesProj") or "build" in g.parts[2:-1]:
+                  continue
+              q = '"' if g.suffix == ".kts" else "'"
+              lst = ", ".join(f"{q}{a}{q}" for a in abis)
+              t = g.read_text(encoding="utf-8", errors="ignore")
+              t2, n1 = re.subn(r'''(abiFilters\s*=?\s*(?:\+=\s*)?(?:setOf\(|listOf\()?\s*)(?:["'][\w-]+["']\s*,?\s*)+''',
+                               lambda m: m.group(1) + lst + " ", t)
+              t2, n2 = re.subn(r'''(include\s+)(?:["'][\w-]+["']\s*,?\s*)+(?=\n\s*(?:universalApk|\}))''',
+                               lambda m: m.group(1) + lst + "\n", t2)
+              if n1 + n2:
+                  g.write_text(t2, encoding="utf-8")
+                  hits += n1 + n2
+                  print(f"ok   ABI -> {abis}: {g} ({n1 + n2})")
+          if hits == 0:
+              print("WARN: abiFilters kothao pawa jay nai - APK-te shob ABI thakbe. Neeche 'ABI check' step dekhun.")
+              for g in SRC.rglob("build.gradle*"):
+                  if g.parts[1].startswith("TMessagesProj"):
+                      for i, line in enumerate(g.read_text(encoding="utf-8", errors="ignore").splitlines(), 1):
+                          if "abi" in line.lower() or "ndk" in line.lower():
+                              print(f"DEBUG {g}:{i}: {line.strip()}")
+          PY
+
+      - name: Show patch diff summary
+        run: git -C Telegram diff --stat || true
+
+      - name: Optional google-services.json (push notification)
+        env:
+          GS: ${{ secrets.GOOGLE_SERVICES_JSON }}
+        run: |
+          if [ -n "$GS" ]; then echo "$GS" > Telegram/TMessagesProj_AppStandalone/google-services.json; echo added; else echo skipped; fi
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      # ubuntu-24.04 runner-e Android SDK already ache; setup-android action lagbe na
+      - name: Install SDK / NDK
+        run: |
+          export ANDROID_HOME="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          export ANDROID_SDK_ROOT="$ANDROID_HOME"
+          SM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          [ -x "$SM" ] || SM="$(find "$ANDROID_HOME/cmdline-tools" -name sdkmanager -type f | head -1)"
+          echo "sdkmanager: $SM"
+          java -version
+          set +o pipefail
+          yes | "$SM" --licenses > /dev/null || true
+          "$SM" --install "platforms;android-36" "build-tools;36.0.0" "ndk;27.2.12479018" "cmake;3.22.1"
+          echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$ANDROID_HOME" >> "$GITHUB_ENV"
+
+      - name: Build APK (32-bit)
+        working-directory: Telegram
+        env:
+          GRADLE_OPTS: -Dorg.gradle.internal.http.connectionTimeout=180000 -Dorg.gradle.internal.http.socketTimeout=180000 -Dorg.gradle.internal.repository.max.retries=10 -Dorg.gradle.internal.repository.initial.backoff=2000
+        run: |
+          chmod +x gradlew
+          for i in 1 2 3; do
+            echo "=== Gradle attempt $i ==="
+            EXTRA=""; [ "$i" -gt 1 ] && EXTRA="--refresh-dependencies"
+            if ./gradlew --no-daemon --max-workers=2 $EXTRA :TMessagesProj_AppStandalone:assembleAfatStandalone; then
+              ok=1; break
+            fi
+            echo "Attempt $i failed, 30s por abar chesta..."; sleep 30
+          done
+          [ "${ok:-0}" = 1 ] || exit 1
+
+      - name: ABI check
+        run: |
+          APK="$(find Telegram/TMessagesProj_AppStandalone/build/outputs/apk -name '*.apk' -print -quit)"
+          test -n "$APK" || { echo "APK not found"; exit 1; }
+          echo "Native library folders inside the APK:"
+          unzip -l "$APK" | grep -o 'lib/[^/]*/' | sort -u
+          if unzip -l "$APK" | grep -q 'lib/arm64-v8a/\|lib/x86'; then
+            echo "WARN: APK-te 32-bit chhara onno ABI-o ache (patch lage nai). Size boro hobe, kintu apnar phone-e cholbe."
+          fi
+
+      - name: Sign APK
+        env:
+          KS_B64: ${{ secrets.KEYSTORE_BASE64 }}
+          KS_PASS: ${{ secrets.KEYSTORE_PASSWORD }}
+          KS_ALIAS: ${{ secrets.KEY_ALIAS }}
+        run: |
+          APK="$(find Telegram/TMessagesProj_AppStandalone/build/outputs/apk -name '*.apk' -print -quit)"
+          test -n "$APK" || { echo "APK not found"; exit 1; }
+          if [ -n "$KS_B64" ]; then
+            echo "$KS_B64" | base64 -d > ks.jks; PASS="$KS_PASS"; ALIAS="$KS_ALIAS"
+          else
+            PASS=aerogram123; ALIAS=aero
+            keytool -genkeypair -keystore ks.jks -storepass $PASS -keypass $PASS -alias $ALIAS -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=AeroGram"
+          fi
+          "$ANDROID_HOME/build-tools/36.0.0/apksigner" sign --ks ks.jks --ks-pass pass:$PASS --ks-key-alias $ALIAS --key-pass pass:$PASS --out "AeroGram-AudioVideo-32bit.apk" "$APK"
+          ls -lh AeroGram-AudioVideo-32bit.apk
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: aerogram-32bit-${{ github.run_number }}
+          name: AeroGram (Audio + Video Call, 32-bit) #${{ github.run_number }}
+          body: Unofficial third-party client based on Telegram for Android (GPLv2). Audio call + Video call. 32-bit (armeabi-v7a).
+          files: AeroGram-AudioVideo-32bit.apk
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
